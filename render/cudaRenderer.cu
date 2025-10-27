@@ -14,6 +14,23 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -379,6 +396,55 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+// shadePixelAccumulate -- (CUDA device code)
+//
+// Version of shadePixel that accumulates color instead of writing to memory
+__device__ __inline__ void
+shadePixelAccumulate(int circleIndex, float2 pixelCenter, float3 p, float4* pixelColor) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f-p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    } else {
+        // simple: each circle has an assigned color
+        int index3 = 3 * circleIndex;
+        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // Alpha blending accumulation
+    pixelColor->x = alpha * rgb.x + oneMinusAlpha * pixelColor->x;
+    pixelColor->y = alpha * rgb.y + oneMinusAlpha * pixelColor->y;
+    pixelColor->z = alpha * rgb.z + oneMinusAlpha * pixelColor->z;
+    pixelColor->w = alpha + pixelColor->w;
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -425,6 +491,51 @@ __global__ void kernelRenderCircles() {
             imgPtr++;
         }
     }
+}
+
+// Each thread renders a pixel and calculates the circles that overlap a given pixel. Returns the
+// index of the circles for each pixel in an array.
+__global__ void kernelCirclesInPixel() {
+    // Each thread handles one pixel
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (pixelX >= cuConstRendererParams.imageWidth || 
+        pixelY >= cuConstRendererParams.imageHeight)
+        return;
+    
+    // Convert to normalized coordinates
+    float2 pixelCenter = make_float2(
+        (pixelX + 0.5f) / cuConstRendererParams.imageWidth,
+        (pixelY + 0.5f) / cuConstRendererParams.imageHeight
+    );
+    
+    // Initialize pixel color from image
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+    
+    // Process circles IN ORDER (0, 1, 2, ...)
+    for (int circleIdx = 0; circleIdx < cuConstRendererParams.numCircles; circleIdx++) {
+        // Get circle data
+        int index3 = 3 * circleIdx;
+        float3 circlePos = *(float3*)(&cuConstRendererParams.position[index3]);
+        // float circleRadius = cuConstRendererParams.radius[circleIdx];
+        
+        // Check if circle affects this pixel using distance test
+        shadePixelAccumulate(circleIdx, pixelCenter, circlePos, &pixelColor);
+        // float diffX = circlePos.x - pixelCenter.x;
+        // float diffY = circlePos.y - pixelCenter.y;
+        // float distanceSquared = diffX * diffX + diffY * diffY;
+        // float radiusSquared = circleRadius * circleRadius;
+        
+        // // If pixel is inside circle, apply shading
+        // if (distanceSquared <= radiusSquared) {
+        //     shadePixelAccumulate(circleIdx, pixelCenter, circlePos, &pixelColor);
+        // }
+    }
+    
+    // Write final pixel color to image
+    int pixelOffset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = pixelColor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -637,9 +748,17 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+
+    // 2D grid for pixels instead of 1D grid for circles
+    dim3 blockDim(16, 16);  // 16x16 = 256 threads per block
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
+    kernelCirclesInPixel<<<gridDim, blockDim>>>();
+    cudaCheckError(cudaDeviceSynchronize());
 }

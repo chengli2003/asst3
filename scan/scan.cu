@@ -14,6 +14,23 @@
 
 #define THREADS_PER_BLOCK 256
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -25,6 +42,38 @@ static inline int nextPow2(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+__global__ void upSweep(int* data, int two_d, int N) {
+    int two_dplus1 = 2 * two_d;
+    
+    // Each thread handles one iteration of the parallel for loop
+    // Use long long to avoid integer overflow
+    long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1;
+    
+    if (i + two_dplus1 - 1 < N) {
+        data[i + two_dplus1 - 1] += data[i + two_d - 1];
+    }
+}
+
+__global__ void downSweep(int* data, int two_d, int N) {
+    int two_dplus1 = 2 * two_d;
+    
+    // Each thread handles one iteration of the parallel for loop
+    // Use long long to avoid integer overflow
+    long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1;
+    
+    if (i + two_dplus1 - 1 < N) {
+        int temp = data[i + two_d - 1];
+        data[i + two_d - 1] = data[i + two_dplus1 - 1];
+        data[i + two_dplus1 - 1] += temp;
+    }
+}
+
+__global__ void setLastElementToZero(int* data, int N) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        data[N - 1] = 0;
+    }
 }
 
 // exclusive_scan --
@@ -54,6 +103,35 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    // Round up to next power of 2 for the algorithm
+    // The arrays are allocated with this size, so we can safely use it
+    int rounded_N = nextPow2(N);
+
+    // Step 1: Up-sweep (reduce) phase
+    for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
+        int iterations = rounded_N / (2 * two_d);
+        int numBlocks = (iterations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        if (numBlocks > 0) {
+            upSweep<<<numBlocks, THREADS_PER_BLOCK>>>(result, two_d, rounded_N);
+            cudaCheckError(cudaDeviceSynchronize());
+        }
+    }
+
+    // Set the last element to 0 for exclusive scan
+    setLastElementToZero<<<1, 1>>>(result, rounded_N);
+    cudaCheckError(cudaDeviceSynchronize());
+
+    // Step 2: Down-sweep phase
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
+        int iterations = rounded_N / (2 * two_d);
+        int numBlocks = (iterations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        if (numBlocks > 0) {
+            downSweep<<<numBlocks, THREADS_PER_BLOCK>>>(result, two_d, rounded_N);
+            cudaCheckError(cudaDeviceSynchronize());
+        }
+    }
 
 }
 
@@ -141,6 +219,26 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+// Kernel to create flags for consecutive equal elements
+__global__ void createFlags(int* input, int* flags, int length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < length - 1) {
+        flags[idx] = (input[idx] == input[idx + 1]) ? 1 : 0;
+    } else if (idx == length - 1) {
+        flags[idx] = 0;  // Last element can't have a repeat
+    }
+}
+
+// Kernel to compact the results using scan output
+__global__ void compactResults(int* flags, int* scan_result, int* output, int length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < length - 1 && flags[idx] == 1) {
+        output[scan_result[idx]] = idx;
+    }
+}
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -161,7 +259,41 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    // Allocate temporary arrays (using power-of-2 size)
+    int rounded_length = nextPow2(length);
+    int* flags;
+    int* scan_result;
+
+    cudaCheckError(cudaMalloc((void**)&flags, sizeof(int) * rounded_length));
+    cudaCheckError(cudaMalloc((void**)&scan_result, sizeof(int) * rounded_length));
+
+    // Initialize arrays to 0
+    cudaCheckError(cudaMemset(flags, 0, sizeof(int) * rounded_length));
+    cudaCheckError(cudaMemset(scan_result, 0, sizeof(int) * rounded_length));
+    
+    // Step 1: Create flags for consecutive equal elements
+    int numBlocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    createFlags<<<numBlocks, THREADS_PER_BLOCK>>>(device_input, flags, length);
+    cudaCheckError(cudaDeviceSynchronize());
+    
+    // Step 2: Exclusive scan on flags to get output positions
+    // Copy flags to scan_result for in-place scan
+    cudaCheckError(cudaMemcpy(scan_result, flags, sizeof(int) * rounded_length, cudaMemcpyDeviceToDevice));
+    exclusive_scan(flags, rounded_length, scan_result);
+    
+    // Step 3: Compact results - write indices to output array
+    compactResults<<<numBlocks, THREADS_PER_BLOCK>>>(flags, scan_result, device_output, length);
+    cudaCheckError(cudaDeviceSynchronize());
+    
+    // Step 4: Get the total count from the last element of scan
+    int total_count;    
+    cudaCheckError(cudaMemcpy(&total_count, &scan_result[length - 1], sizeof(int), cudaMemcpyDeviceToHost));
+    
+    // Clean up
+    cudaFree(flags);
+    cudaFree(scan_result);
+    
+    return total_count; 
 }
 
 
